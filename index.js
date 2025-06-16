@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
@@ -21,14 +20,14 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // JWT Secret (in production, use environment variable)
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+const JWT_SECRET = process.env.JWT_SECRET || 'starconnect_secret';
 
 // In-memory storage (replace with database in production)
 const users = [
   {
     id: 1,
-    email: 'celebrity@starconnect.com',
-    password: '$2b$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', // password: celebrity123
+    email: 'celeb@example.com',
+    password: '123456', // password: 123456
     type: 'celebrity',
     name: 'John Celebrity',
     followers: [],
@@ -36,8 +35,8 @@ const users = [
   },
   {
     id: 2,
-    email: 'public@starconnect.com',
-    password: '$2b$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', // password: public123
+    email: 'user@example.com',
+    password: '123456', // password: 123456
     type: 'public',
     name: 'Jane Public',
     followers: [],
@@ -99,9 +98,8 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Check password
-    const isValidPassword = await bcrypt.compare(password, user.password);
-    if (!isValidPassword) {
+    // Check password (plain string comparison for demo)
+    if (password !== user.password) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
