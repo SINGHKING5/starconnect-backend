@@ -5,6 +5,22 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
+// Import services
+const { connectRedis, disconnectRedis, publishMessage, subscribeToChannel } = require('./services/redis');
+const { 
+  registerUserSocket, 
+  unregisterUserSocket, 
+  addNotification, 
+  getNotifications, 
+  getUnreadCount, 
+  markAsRead, 
+  markAllAsRead,
+  sendNotificationToUser,
+  createPostNotification,
+  createLikeNotification,
+  createCommentNotification
+} = require('./services/notifications');
+
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
@@ -14,72 +30,107 @@ const io = socketIo(server, {
   }
 });
 
+// Make io available to routes
+app.set('io', io);
+
+// Connect to Redis
+connectRedis();
+
 // Middleware
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// JWT Secret (in production, use environment variable)
-const JWT_SECRET = process.env.JWT_SECRET || 'starconnect_secret';
-
-// In-memory storage (replace with database in production)
-const users = [
-  {
-    id: 1,
-    email: 'celeb@example.com',
-    password: '123456', // password: 123456
-    type: 'celebrity',
-    name: 'John Celebrity',
-    followers: [],
-    following: []
-  },
-  {
-    id: 2,
-    email: 'user@example.com',
-    password: '123456', // password: 123456
-    type: 'public',
-    name: 'Jane Public',
-    followers: [],
-    following: []
+// Increase payload limits for image uploads (up to 10MB)
+app.use(express.json({ 
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    // Store raw body for potential use
+    req.rawBody = buf;
   }
-];
+}));
 
-const posts = [
-  {
-    id: 1,
-    userId: 1,
-    content: 'Excited to connect with my fans on StarConnect!',
-    timestamp: new Date(),
-    likes: 0,
-    comments: []
-  },
-  {
-    id: 2,
-    userId: 2,
-    content: 'Just joined StarConnect to follow my favorite celebrities!',
-    timestamp: new Date(),
-    likes: 0,
-    comments: []
-  }
-];
+app.use(express.urlencoded({ 
+  extended: true, 
+  limit: '10mb' 
+}));
 
-// Authentication middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid token' });
-    }
-    req.user = user;
-    next();
+// Add timeout middleware for large requests
+app.use((req, res, next) => {
+  // Set timeout for large requests (30 seconds)
+  req.setTimeout(30000, () => {
+    res.status(408).json({ error: 'Request timeout - file too large or processing too slow' });
   });
-};
+  next();
+});
+
+// Import middleware and data
+const { authenticateToken, JWT_SECRET } = require('./middleware/auth');
+const users = require('./data/users');
+
+// Import routes
+const postsRouter = require('./routes/posts');
+const usersRouter = require('./routes/users');
+
+// Use routes
+app.use('/api/posts', postsRouter);
+app.use('/api/users', usersRouter);
+
+// Subscribe to Redis channels for real-time updates
+subscribeToChannel('newPost', async (data) => {
+  try {
+    const { post, author } = data;
+    const users = require('./data/users');
+    
+    // Find all users who follow this celebrity
+    const followers = users.filter(user => 
+      user.following && user.following.includes(author.id)
+    );
+    
+    // Create notification for each follower
+    followers.forEach(follower => {
+      const notification = createPostNotification(post, author);
+      addNotification(follower.id, notification);
+      sendNotificationToUser(follower.id, notification, io);
+    });
+    
+    console.log(`📢 Sent new post notifications to ${followers.length} followers`);
+  } catch (error) {
+    console.error('❌ Error handling new post notification:', error);
+  }
+});
+
+subscribeToChannel('newLike', async (data) => {
+  try {
+    const { post, liker, postAuthor } = data;
+    
+    // Don't notify if user likes their own post
+    if (liker.id === postAuthor.id) return;
+    
+    const notification = createLikeNotification(post, liker, postAuthor);
+    addNotification(postAuthor.id, notification);
+    sendNotificationToUser(postAuthor.id, notification, io);
+    
+    console.log(`❤️ Sent like notification to ${postAuthor.name}`);
+  } catch (error) {
+    console.error('❌ Error handling like notification:', error);
+  }
+});
+
+subscribeToChannel('newComment', async (data) => {
+  try {
+    const { post, comment, commenter, postAuthor } = data;
+    
+    // Don't notify if user comments on their own post
+    if (commenter.id === postAuthor.id) return;
+    
+    const notification = createCommentNotification(post, comment, commenter, postAuthor);
+    addNotification(postAuthor.id, notification);
+    sendNotificationToUser(postAuthor.id, notification, io);
+    
+    console.log(`💬 Sent comment notification to ${postAuthor.name}`);
+  } catch (error) {
+    console.error('❌ Error handling comment notification:', error);
+  }
+});
 
 // Routes
 
@@ -131,67 +182,73 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// GET /posts - Get all posts
-app.get('/posts', authenticateToken, (req, res) => {
+// GET /api/notifications - Get user notifications
+app.get('/api/notifications', authenticateToken, (req, res) => {
   try {
-    const postsWithUserInfo = posts.map(post => {
-      const user = users.find(u => u.id === post.userId);
-      return {
-        ...post,
-        userName: user ? user.name : 'Unknown User',
-        userType: user ? user.type : 'unknown'
-      };
-    });
-
+    const userId = req.user.userId;
+    const notifications = getNotifications(userId);
+    const unreadCount = getUnreadCount(userId);
+    
     res.json({
       success: true,
-      posts: postsWithUserInfo.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+      notifications,
+      unreadCount
     });
   } catch (error) {
-    console.error('Get posts error:', error);
+    console.error('Get notifications error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// POST /posts - Create a new post
-app.post('/posts', authenticateToken, (req, res) => {
+// POST /api/notifications/:id/read - Mark notification as read
+app.post('/api/notifications/:id/read', authenticateToken, (req, res) => {
   try {
-    const { content } = req.body;
-
-    if (!content || content.trim().length === 0) {
-      return res.status(400).json({ error: 'Post content is required' });
+    const userId = req.user.userId;
+    const notificationId = req.params.id;
+    
+    const success = markAsRead(userId, notificationId);
+    
+    if (success) {
+      res.json({
+        success: true,
+        message: 'Notification marked as read'
+      });
+    } else {
+      res.status(404).json({ error: 'Notification not found' });
     }
-
-    const newPost = {
-      id: posts.length + 1,
-      userId: req.user.userId,
-      content: content.trim(),
-      timestamp: new Date(),
-      likes: 0,
-      comments: []
-    };
-
-    posts.push(newPost);
-
-    // Emit socket event for real-time updates
-    io.emit('newPost', {
-      ...newPost,
-      userName: req.user.name,
-      userType: req.user.type
-    });
-
-    res.json({
-      success: true,
-      post: {
-        ...newPost,
-        userName: req.user.name,
-        userType: req.user.type
-      }
-    });
   } catch (error) {
-    console.error('Create post error:', error);
+    console.error('Mark notification read error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// POST /api/notifications/read-all - Mark all notifications as read
+app.post('/api/notifications/read-all', authenticateToken, (req, res) => {
+  try {
+    const userId = req.user.userId;
+    markAllAsRead(userId);
+    
+    res.json({
+      success: true,
+      message: 'All notifications marked as read'
+    });
+  } catch (error) {
+    console.error('Mark all notifications read error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Legacy routes for backward compatibility
+// GET /posts - Get all posts (redirects to new API)
+app.get('/posts', authenticateToken, (req, res) => {
+  // Redirect to new API endpoint
+  res.redirect('/api/posts');
+});
+
+// POST /posts - Create a new post (redirects to new API)
+app.post('/posts', authenticateToken, (req, res) => {
+  // Redirect to new API endpoint
+  res.redirect('/api/posts');
 });
 
 // GET /feed - Get personalized feed for the authenticated user
@@ -202,6 +259,9 @@ app.get('/feed', authenticateToken, (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    // Get posts from the posts router
+    const { posts } = require('./routes/posts');
+    
     // Get posts from users that the current user follows
     const followingIds = user.following;
     const feedPosts = posts
@@ -307,13 +367,42 @@ app.get('/users', authenticateToken, (req, res) => {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
+  // Authenticate socket connection
+  socket.on('authenticate', async (token) => {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const userId = decoded.userId;
+      
+      // Register user socket
+      registerUserSocket(userId, socket.id);
+      socket.userId = userId;
+      
+      // Join user's personal room
+      socket.join(`user_${userId}`);
+      
+      // Send current unread notification count
+      const unreadCount = getUnreadCount(userId);
+      socket.emit('notificationCount', { unreadCount });
+      
+      console.log(`🔗 User ${userId} authenticated on socket ${socket.id}`);
+    } catch (error) {
+      console.error('❌ Socket authentication error:', error);
+      socket.emit('authError', { message: 'Authentication failed' });
+    }
+  });
+
   socket.on('join', (userId) => {
     socket.join(`user_${userId}`);
     console.log(`User ${userId} joined their room`);
   });
 
   socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
+    if (socket.userId) {
+      unregisterUserSocket(socket.userId);
+      console.log(`🔌 User ${socket.userId} disconnected from socket ${socket.id}`);
+    } else {
+      console.log('User disconnected:', socket.id);
+    }
   });
 
   socket.on('typing', (data) => {
@@ -351,6 +440,19 @@ server.listen(PORT, () => {
   console.log(`🚀 StarConnect server running on port ${PORT}`);
   console.log(`📡 Socket.io initialized`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`📝 Posts API: http://localhost:${PORT}/api/posts`);
+  console.log(`👤 Users API: http://localhost:${PORT}/api/users`);
+  console.log(`🔔 Notifications API: http://localhost:${PORT}/api/notifications`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  await disconnectRedis();
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
 });
 
 module.exports = { app, server, io }; 
